@@ -113,6 +113,40 @@ bool isTagValidForReset(const vector<cv::Point2f> &corners, const cv::Size &imag
   return size_ratio > ratio;
 }
 
+struct MarkerObservation {
+    int marker_id;
+    sl::Transform camera_to_marker;
+    double confidence;
+    double timestamp;
+};
+
+struct MarkerPosition {
+    sl::float3 position;
+    sl::float3 orientation;
+    double confidence;
+    int observation_count;
+    std::vector<MarkerObservation> observations;
+
+    MarkerPosition() : confidence(0), observation_count(0) {}
+};
+
+std::map<int, MarkerPosition> marker_positions;
+
+double calculateConfidence(const vector<cv::Point2f>& corners, const cv::Size& image_size) {
+    // Calculate marker area ratio to image area
+    double side1 = cv::norm(corners[1] - corners[0]);
+    double side2 = cv::norm(corners[2] - corners[1]);
+    double marker_area = side1 * side2;
+    double image_area = image_size.width * image_size.height;
+    return marker_area / image_area;
+}
+
+sl::Transform estimateMarkerPose(const cv::Vec3d& rvec, const cv::Vec3d& tvec) {
+    sl::Transform pose;
+    pose.setTranslation(sl::float3(tvec(0), tvec(1), tvec(2)));
+    pose.setRotationVector(sl::float3(rvec(0), rvec(1), rvec(2)));
+    return pose;
+}
 
 void parse_args(int argc, char **argv, InitParameters &param, std::map<int, sl::Transform> &aruco_transforms)
 {
@@ -185,6 +219,29 @@ void parse_args(int argc, char **argv, InitParameters &param, std::map<int, sl::
   {
     // Default
   }
+}
+
+void saveMarkerPositions(const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for writing: " << filename << std::endl;
+        return;
+    }
+
+    file << "marker_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,confidence,observations\n";
+    for (const auto& marker : marker_positions) {
+        file << marker.first << ","
+             << marker.second.position.x << ","
+             << marker.second.position.y << ","
+             << marker.second.position.z << ","
+             << marker.second.orientation.x << ","
+             << marker.second.orientation.y << ","
+             << marker.second.orientation.z << ","
+             << marker.second.confidence << ","
+             << marker.second.observation_count << "\n";
+    }
+    file.close();
+    std::cout << "Marker positions saved to: " << filename << std::endl;
 }
 
 int main(int argc, char **argv)
@@ -329,74 +386,62 @@ int main(int argc, char **argv)
                   cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(236, 188, 26), 2);
 
       // if at least one marker detected
-      if (ids.size() > 0)
-      {
-
+      if (ids.size() > 0) {
         cv::aruco::estimatePoseSingleMarkers(corners, actual_marker_size_meters,
-                                             camera_matrix, dist_coeffs, rvecs,
-                                             tvecs);
+                                             camera_matrix, dist_coeffs, rvecs, tvecs);
 
-        float nearest_distance = 1e9f;
-        int ids_size = ids.size();
-        for (int i = 0; i < ids_size; i++)
-        {
+        // Process each detected marker
+        for (size_t i = 0; i < ids.size(); i++) {
+            int marker_id = ids[i];
+            
+            // Calculate observation confidence based on marker size in image
+            double confidence = calculateConfidence(corners[i], cv::Size(image_zed.getWidth(), image_zed.getHeight()));
+            
+            // Skip if marker is too small/far
+            if (confidence < 0.001) continue;
 
-          sl::float3 t;
-          t.x = tvecs[i](0);
-          t.y = tvecs[i](1);
-          t.z = tvecs[i](2);
-          float current_distance = t.norm();
-          if (nearest_distance > current_distance)
-          {
-            nearest_distance = current_distance;
-            nearest_aruco_index = i;
-          }
+            // Create marker observation in camera coordinate system
+            MarkerObservation observation;
+            observation.marker_id = marker_id;
+            observation.camera_to_marker = estimateMarkerPose(rvecs[i], tvecs[i]);
+            observation.confidence = confidence;
+            observation.timestamp = zed.getTimestamp(sl::TIME_REFERENCE::IMAGE).getMilliseconds();
+
+            // Update marker position
+            auto& marker = marker_positions[marker_id];
+            marker.observations.push_back(observation);
+            marker.observation_count++;
+
+            // Update running average position and orientation
+            sl::float3 new_position = observation.camera_to_marker.getTranslation();
+            sl::float3 new_orientation = observation.camera_to_marker.getEulerAngles();
+            
+            if (marker.observation_count == 1) {
+                marker.position = new_position;
+                marker.orientation = new_orientation;
+                marker.confidence = confidence;
+            } else {
+                // Weighted average based on confidence
+                float alpha = confidence / (marker.confidence + confidence);
+                marker.position = marker.position * (1 - alpha) + new_position * alpha;
+                marker.orientation = marker.orientation * (1 - alpha) + new_orientation * alpha;
+                marker.confidence = (marker.confidence + confidence) / 2;
+            }
+
+            // Output current marker position (you can modify this based on your needs)
+            std::cout << "Marker " << marker_id << " Position (in camera frame):" 
+                      << " x: " << new_position.x
+                      << " y: " << new_position.y
+                      << " z: " << new_position.z 
+                      << " confidence: " << confidence << std::endl;
         }
 
-        // this estimate gives the WORLD to CAMERA basis change:
-        // WORLD is the position of the ArUco tag.
-        // From ArUco side, x => left, y => up, z => forward
-        // The camera pose is expressed in IMAGE coordinate system :
-        // x => right, y down and z forward
-        // It is decomposed as:
-        // pose = ARUCO_TO_IMAGE_basis_change * ARUCO_WORLD_to_ARUCO_CAMERA_basis_change (ARUCO_CAMERA is the same coordinate system as ArUco world but attached to the camera)
-
-        pose.setTranslation(sl::float3(tvecs[nearest_aruco_index](0), tvecs[nearest_aruco_index](1), tvecs[nearest_aruco_index](2)));
-        pose.setRotationVector(
-            sl::float3(rvecs[nearest_aruco_index](0), rvecs[nearest_aruco_index](1), rvecs[nearest_aruco_index](2)));
-
-        // to obtain the pose with respect to the ArUco world, we remove ARUCO_TO_IMAGE to the initial pose
-        pose = IMAGE_TO_ARUCO_basis_change * pose;
-
-        // now that we have the pose from ArUco world to ArUco in camera (the coordinate system attached to the camera is the same as aruco world => x left, y up and z forward) we need to invert to match zed pose output (camera to world basis change)
-        pose.inverse();
-
-        // the pose here is expressed in ArUco coordinate system. It is not
-        // available in SDK coordinate system. It represents camera to world basis change lets transforms this pose to user coordinate system pose (init_params.coordinate_system) to do that, we have to compute IMAGE_TO_ARUCO_basis_change and user_to_IMAGE_basis_change
-        // IMAGE_TO_ARUCO_basis_change is known, lets get user_to_IMAGE_basis_change from SDK
-        auto user_coordinate_to_image = sl::getCoordinateTransformConversion4f(
-            init_params.coordinate_system, sl::COORDINATE_SYSTEM::IMAGE);
-        can_reset = true;
-
-        // use user_coordinate_to_ARUCO to get the same ARUCO pose but expressed in user coordinate  (init_params.coordinate_system)
-        sl::Transform user_coordinate_to_ARUCO =
-            IMAGE_TO_ARUCO_basis_change * user_coordinate_to_image;
-        sl::Transform ARUCO_to_user_coordinate =
-            sl::Transform::inverse(user_coordinate_to_ARUCO);
-
-        // apply transform, the resulting pose is now expressed in user coordinate system
-        pose = ARUCO_to_user_coordinate * pose * user_coordinate_to_ARUCO;
-
-        // apply initial ArUco world pose, expressed in
-        // init_params.coordinate_system.
-        // Now pose is located with respect to the new world given by initial_aruco_pose and expressed in init_params.coordinate_system
-        auto aruco_world = aruco_transforms.find(ids[nearest_aruco_index]);
-        if (aruco_world != aruco_transforms.end())
-        {
-          pose = aruco_world->second * pose;
-        }
-
+        // Optional: Visualize markers
         cv::aruco::drawDetectedMarkers(image_ocv_rgb, corners, ids);
+        for (size_t i = 0; i < ids.size(); i++) {
+            cv::aruco::drawAxis(image_ocv_rgb, camera_matrix, dist_coeffs, 
+                               rvecs[i], tvecs[i], actual_marker_size_meters * 0.5f);
+        }
       }
       else
         can_reset = false;
@@ -544,6 +589,10 @@ int main(int argc, char **argv)
     if ((key == 'a' || key == 'A'))
     {
       zed_tracking = false;
+    }
+
+    if (key == 's' || key == 'S') {
+        saveMarkerPositions("marker_positions.csv");
     }
   }
   zed.close();
