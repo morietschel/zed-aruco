@@ -35,6 +35,7 @@
 #include <opencv2/opencv.hpp>
 
 #include <fstream>
+#include <chrono>
 
 using namespace sl;
 using namespace std;
@@ -113,6 +114,7 @@ bool isTagValidForReset(const vector<cv::Point2f> &corners, const cv::Size &imag
   return size_ratio > ratio;
 }
 
+// First, add all structure definitions
 struct MarkerObservation {
     int marker_id;
     sl::Transform camera_to_marker;
@@ -129,6 +131,174 @@ struct MarkerPosition {
 
     MarkerPosition() : confidence(0), observation_count(0) {}
 };
+
+struct RecordingSession {
+    bool is_recording;
+    double start_time;
+    double end_time;
+    std::map<int, std::vector<MarkerObservation>> observations;
+    
+    RecordingSession() : is_recording(false), start_time(0), end_time(0) {}
+};
+
+struct MarkerRelation {
+    int marker1_id;
+    int marker2_id;
+    sl::Transform relative_transform;
+    double confidence;
+    int observation_count;
+};
+
+// Then, add global variables
+std::vector<RecordingSession> recording_sessions;
+std::map<std::pair<int, int>, MarkerRelation> marker_relations;
+
+// Then, add function declarations (prototypes)
+void processRecordingSession(const RecordingSession& session);
+void startRecording();
+void stopRecording();
+void calculateAbsolutePositions(const std::vector<RecordingSession>& sessions, 
+                               std::map<int, MarkerPosition>& absolute_positions);
+void saveAbsolutePositions(const std::string& filename);
+bool validateTransform(const sl::Transform& transform);
+
+// Add this helper function near the top with other utility functions
+sl::Transform interpolateTransforms(const sl::Transform& t1, const sl::Transform& t2, float alpha) {
+    sl::Transform result;
+    
+    // Interpolate translation
+    auto trans1 = t1.getTranslation();
+    auto trans2 = t2.getTranslation();
+    result.setTranslation(sl::float3(
+        trans1.x * (1-alpha) + trans2.x * alpha,
+        trans1.y * (1-alpha) + trans2.y * alpha,
+        trans1.z * (1-alpha) + trans2.z * alpha
+    ));
+    
+    // Interpolate rotation (simple linear interpolation of euler angles)
+    auto rot1 = t1.getEulerAngles();
+    auto rot2 = t2.getEulerAngles();
+    result.setRotationVector(sl::float3(
+        rot1.x * (1-alpha) + rot2.x * alpha,
+        rot1.y * (1-alpha) + rot2.y * alpha,
+        rot1.z * (1-alpha) + rot2.z * alpha
+    ));
+    
+    return result;
+}
+
+// Then, implement the functions
+void processRecordingSession(const RecordingSession& session) {
+    std::cout << "Processing recording session..." << std::endl;
+    
+    // Clear previous relations
+    marker_relations.clear();
+    
+    // Process all observations where multiple markers were visible at the same timestamp
+    for (const auto& marker1_obs : session.observations) {
+        for (const auto& obs1 : marker1_obs.second) {
+            // Find other markers visible at this timestamp
+            for (const auto& marker2_obs : session.observations) {
+                if (marker1_obs.first >= marker2_obs.first) continue; // Skip self and duplicates
+                
+                // Find matching observation by timestamp
+                for (const auto& obs2 : marker2_obs.second) {
+                    if (std::abs(obs1.timestamp - obs2.timestamp) < 10) { // 10ms threshold
+                        // Calculate relative transform between markers
+                        sl::Transform relative_transform = 
+                            sl::Transform::inverse(obs1.camera_to_marker) * obs2.camera_to_marker;
+                        
+                        if (!validateTransform(relative_transform)) {
+                            std::cerr << "Invalid transform detected, skipping observation" << std::endl;
+                            continue;
+                        }
+                        
+                        // Update marker relation
+                        auto relation_key = std::make_pair(marker1_obs.first, marker2_obs.first);
+                        auto& relation = marker_relations[relation_key];
+                        
+                        if (relation.observation_count == 0) {
+                            relation.marker1_id = marker1_obs.first;
+                            relation.marker2_id = marker2_obs.first;
+                            relation.relative_transform = relative_transform;
+                            relation.confidence = (obs1.confidence + obs2.confidence) / 2;
+                            relation.observation_count = 1;
+                        } else {
+                            // Update running average
+                            float alpha = 1.0f / (relation.observation_count + 1);
+                            relation.relative_transform = 
+                                interpolateTransforms(relation.relative_transform, relative_transform, alpha);
+                            relation.confidence = 
+                                (relation.confidence * relation.observation_count + 
+                                 (obs1.confidence + obs2.confidence) / 2) / (relation.observation_count + 1);
+                            relation.observation_count++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    std::cout << "Processed " << session.observations.size() << " markers with relations:" << std::endl;
+    for (const auto& relation : marker_relations) {
+        std::cout << "Markers " << relation.first.first << " -> " << relation.first.second 
+                  << ": " << relation.second.observation_count << " observations" << std::endl;
+    }
+}
+// Add this function to save raw recording data
+void saveRawRecording(const RecordingSession& session, const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for writing: " << filename << std::endl;
+        return;
+    }
+
+    // Write session metadata
+    file << "# Recording Session\n";
+    file << "# start_time: " << session.start_time << "\n";
+    file << "# end_time: " << session.end_time << "\n";
+    file << "# Format: marker_id,timestamp,tx,ty,tz,qx,qy,qz,qw,confidence\n";
+
+    // Write all observations
+    for (const auto& marker_obs : session.observations) {
+        for (const auto& obs : marker_obs.second) {
+            auto trans = obs.camera_to_marker.getTranslation();
+            auto orient = obs.camera_to_marker.getOrientation();
+            
+            file << obs.marker_id << ","
+                 << obs.timestamp << ","
+                 << trans.x << ","
+                 << trans.y << ","
+                 << trans.z << ","
+                 << orient.x << ","
+                 << orient.y << ","
+                 << orient.z << ","
+                 << orient.w << ","
+                 << obs.confidence << "\n";
+        }
+    }
+
+    file.close();
+    std::cout << "Raw recording data saved to: " << filename << std::endl;
+}
+void startRecording() {
+    RecordingSession session;
+    session.is_recording = true;
+    session.start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    recording_sessions.push_back(session);
+}
+
+void stopRecording() {
+    if (!recording_sessions.empty()) {
+        auto& session = recording_sessions.back();
+        session.is_recording = false;
+        session.end_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        saveRawRecording(session, "recording_" + std::to_string(session.end_time) + ".csv");
+        processRecordingSession(session);
+    }
+}
 
 std::map<int, MarkerPosition> marker_positions;
 
@@ -243,6 +413,283 @@ void saveMarkerPositions(const std::string& filename) {
     file.close();
     std::cout << "Marker positions saved to: " << filename << std::endl;
 }
+
+void saveMarkerRelations(const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for writing: " << filename << std::endl;
+        return;
+    }
+
+    file << "marker1_id,marker2_id,tx,ty,tz,rx,ry,rz,confidence,observations\n";
+    for (const auto& relation : marker_relations) {
+        const auto& r = relation.second;
+        auto euler = r.relative_transform.getEulerAngles();
+        auto trans = r.relative_transform.getTranslation();
+        
+        file << r.marker1_id << ","
+             << r.marker2_id << ","
+             << trans.x << ","
+             << trans.y << ","
+             << trans.z << ","
+             << euler.x << ","
+             << euler.y << ","
+             << euler.z << ","
+             << r.confidence << ","
+             << r.observation_count << "\n";
+    }
+    file.close();
+    std::cout << "Marker relations saved to: " << filename << std::endl;
+}
+
+// Add this function to convert relative positions into absolute positions
+void calculateAbsolutePositions(const std::vector<RecordingSession>& sessions, 
+                               std::map<int, MarkerPosition>& absolute_positions) {
+    if (sessions.empty()) {
+        std::cout << "No recording sessions available." << std::endl;
+        return;
+    }
+
+    // First, find all unique marker IDs and count their observations
+    std::map<int, int> marker_observations;
+    for (const auto& session : sessions) {
+        for (const auto& marker_data : session.observations) {
+            marker_observations[marker_data.first] += marker_data.second.size();
+        }
+    }
+
+    if (marker_observations.empty()) {
+        std::cout << "No marker observations found." << std::endl;
+        return;
+    }
+
+    // Find the most observed marker to use as reference
+    int reference_marker = -1;
+    int max_observations = 0;
+    for (const auto& marker_pair : marker_observations) {
+        if (marker_pair.second > max_observations) {
+            max_observations = marker_pair.second;
+            reference_marker = marker_pair.first;
+        }
+    }
+
+    std::cout << "Using marker " << reference_marker << " as reference (observed " 
+              << marker_observations[reference_marker] << " times)" << std::endl;
+
+    // Process each timestamp where multiple markers were visible
+    std::map<std::pair<int, int>, std::vector<sl::Transform>> relative_transforms;
+    std::map<std::pair<int, int>, std::vector<double>> transform_confidences;
+
+    for (const auto& session : sessions) {
+        // Group observations by timestamp
+        std::map<double, std::vector<MarkerObservation>> observations_by_time;
+        
+        for (const auto& marker_data : session.observations) {
+            for (const auto& obs : marker_data.second) {
+                observations_by_time[obs.timestamp].push_back(obs);
+            }
+        }
+
+        // Process each timestamp where multiple markers were visible
+        for (const auto& time_obs : observations_by_time) {
+            if (time_obs.second.size() < 2) continue;
+
+            // Calculate relative transforms between all marker pairs
+            for (size_t i = 0; i < time_obs.second.size(); i++) {
+                for (size_t j = i + 1; j < time_obs.second.size(); j++) {
+                    const auto& obs1 = time_obs.second[i];
+                    const auto& obs2 = time_obs.second[j];
+
+                    auto pair_key = std::make_pair(
+                        std::min(obs1.marker_id, obs2.marker_id),
+                        std::max(obs1.marker_id, obs2.marker_id)
+                    );
+
+                    sl::Transform relative_transform;
+                    if (obs1.marker_id < obs2.marker_id) {
+                        relative_transform = sl::Transform::inverse(obs1.camera_to_marker) * obs2.camera_to_marker;
+                    } else {
+                        relative_transform = sl::Transform::inverse(obs2.camera_to_marker) * obs1.camera_to_marker;
+                    }
+
+                    double confidence = (obs1.confidence + obs2.confidence) / 2.0;
+                    relative_transforms[pair_key].push_back(relative_transform);
+                    transform_confidences[pair_key].push_back(confidence);
+                }
+            }
+        }
+    }
+
+    // Calculate average transforms weighted by confidence
+    std::map<std::pair<int, int>, sl::Transform> average_transforms;
+    std::map<std::pair<int, int>, double> transform_weights;
+
+    for (const auto& transform_data : relative_transforms) {
+        const auto& pair_key = transform_data.first;
+        const auto& transforms = transform_data.second;
+        const auto& confidences = transform_confidences[pair_key];
+
+        if (transforms.empty()) continue;
+
+        // Calculate weighted average transform
+        sl::Transform avg_transform = transforms[0];
+        double total_weight = confidences[0];
+        for (size_t i = 1; i < transforms.size(); i++) {
+            // Use exponential weighted average for better stability
+            float alpha = std::exp(-1.0f / confidences[i]) / 
+                         (std::exp(-1.0f / total_weight) + std::exp(-1.0f / confidences[i]));
+            avg_transform = interpolateTransforms(avg_transform, transforms[i], alpha);
+            total_weight += confidences[i];
+        }
+
+        average_transforms[pair_key] = avg_transform;
+        transform_weights[pair_key] = total_weight / transforms.size();
+    }
+
+    // Set reference marker at origin
+    absolute_positions[reference_marker] = MarkerPosition();
+    absolute_positions[reference_marker].position = sl::float3(0, 0, 0);
+    absolute_positions[reference_marker].orientation = sl::float3(0, 0, 0);
+    absolute_positions[reference_marker].confidence = 1.0;
+    absolute_positions[reference_marker].observation_count = marker_observations[reference_marker];
+
+    // Use breadth-first search to propagate positions
+    std::queue<int> to_process;
+    std::set<int> processed;
+    to_process.push(reference_marker);
+    processed.insert(reference_marker);
+
+    while (!to_process.empty()) {
+        int current = to_process.front();
+        to_process.pop();
+
+        // Find all connected markers
+        for (const auto& transform_data : average_transforms) {
+            int other_marker;
+            sl::Transform relative_transform;
+            
+            if (transform_data.first.first == current) {
+                other_marker = transform_data.first.second;
+                relative_transform = transform_data.second;
+            } else if (transform_data.first.second == current) {
+                other_marker = transform_data.first.first;
+                relative_transform = sl::Transform::inverse(transform_data.second);
+            } else {
+                continue;
+            }
+
+            if (processed.find(other_marker) != processed.end()) {
+                continue;
+            }
+
+            // Calculate absolute position
+            sl::Transform current_transform;
+            current_transform.setTranslation(absolute_positions[current].position);
+            current_transform.setRotationVector(absolute_positions[current].orientation);
+
+            sl::Transform other_transform = current_transform * relative_transform;
+
+            // Store result
+            absolute_positions[other_marker].position = other_transform.getTranslation();
+            absolute_positions[other_marker].orientation = other_transform.getEulerAngles();
+            absolute_positions[other_marker].confidence = 
+                transform_weights[transform_data.first.first < transform_data.first.second ? 
+                    transform_data.first : 
+                    std::make_pair(transform_data.first.second, transform_data.first.first)];
+            absolute_positions[other_marker].observation_count = marker_observations[other_marker];
+
+            to_process.push(other_marker);
+            processed.insert(other_marker);
+        }
+    }
+
+    // Print summary
+    std::cout << "\nCalculated absolute positions from " << sessions.size() << " recording sessions:" << std::endl;
+    for (const auto& pos : absolute_positions) {
+        std::cout << "Marker " << pos.first 
+                  << " (confidence: " << pos.second.confidence 
+                  << ", observations: " << pos.second.observation_count << "):" << std::endl;
+        std::cout << "  Position: " << pos.second.position.x << ", " 
+                                   << pos.second.position.y << ", " 
+                                   << pos.second.position.z << std::endl;
+        std::cout << "  Orientation: " << pos.second.orientation.x << ", " 
+                                      << pos.second.orientation.y << ", " 
+                                      << pos.second.orientation.z << std::endl;
+    }
+}
+
+void saveAbsolutePositions(const std::string& filename) {
+    std::map<int, MarkerPosition> absolute_positions;
+    calculateAbsolutePositions(recording_sessions, absolute_positions);
+
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for writing: " << filename << std::endl;
+        return;
+    }
+
+    // Find reference marker (the one at origin)
+    int reference_marker = -1;
+    for (const auto& marker : absolute_positions) {
+        const auto& pos = marker.second.position;
+        if (pos.x == 0 && pos.y == 0 && pos.z == 0) {
+            reference_marker = marker.first;
+            break;
+        }
+    }
+
+    // Write metadata as comments
+    file << "# Reference marker ID: " << reference_marker << "\n";
+    file << "# Format: marker_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,confidence,observations\n";
+
+    // Write data
+    for (const auto& marker : absolute_positions) {
+        file << marker.first << ","
+             << marker.second.position.x << ","
+             << marker.second.position.y << ","
+             << marker.second.position.z << ","
+             << marker.second.orientation.x << ","
+             << marker.second.orientation.y << ","
+             << marker.second.orientation.z << ","
+             << marker.second.confidence << ","
+             << marker.second.observation_count << "\n";
+    }
+    file.close();
+    std::cout << "Absolute marker positions saved to: " << filename << std::endl;
+    std::cout << "Reference marker used: " << reference_marker << std::endl;
+}
+
+// Add this global variable near the top with other globals
+const int PRINT_INTERVAL_MS = 2000; // Print every 2 seconds
+double last_print_time = 0;
+
+bool validateTransform(const sl::Transform& transform) {
+    // Check for NaN values
+    auto trans = transform.getTranslation();
+    if (std::isnan(trans.x) || std::isnan(trans.y) || std::isnan(trans.z)) {
+        return false;
+    }
+
+    // Check quaternion normalization
+    auto quat = transform.getOrientation();
+    float norm = std::sqrt(quat.x*quat.x + quat.y*quat.y + quat.z*quat.z + quat.w*quat.w);
+    if (std::abs(norm - 1.0f) > 1e-3) {
+        return false;
+    }
+
+    // Check for reasonable translation values (adjust thresholds as needed)
+    const float MAX_TRANSLATION = 10.0f; // meters
+    if (std::abs(trans.x) > MAX_TRANSLATION || 
+        std::abs(trans.y) > MAX_TRANSLATION || 
+        std::abs(trans.z) > MAX_TRANSLATION) {
+        return false;
+    }
+
+    return true;
+}
+
+// Add this constant near the top with other constants
+const double MIN_CONFIDENCE_THRESHOLD = 0.003; // Adjust this value based on your needs
 
 int main(int argc, char **argv)
 {
@@ -397,8 +844,11 @@ int main(int argc, char **argv)
             // Calculate observation confidence based on marker size in image
             double confidence = calculateConfidence(corners[i], cv::Size(image_zed.getWidth(), image_zed.getHeight()));
             
-            // Skip if marker is too small/far
-            if (confidence < 0.001) continue;
+            // Skip if confidence is below threshold
+            if (confidence < MIN_CONFIDENCE_THRESHOLD) {
+                std::cout << "Skipping marker " << marker_id << " due to low confidence: " << confidence << std::endl;
+                continue;
+            }
 
             // Create marker observation in camera coordinate system
             MarkerObservation observation;
@@ -406,6 +856,11 @@ int main(int argc, char **argv)
             observation.camera_to_marker = estimateMarkerPose(rvecs[i], tvecs[i]);
             observation.confidence = confidence;
             observation.timestamp = zed.getTimestamp(sl::TIME_REFERENCE::IMAGE).getMilliseconds();
+
+            // Add observation to current recording session if recording
+            if (!recording_sessions.empty() && recording_sessions.back().is_recording) {
+                recording_sessions.back().observations[marker_id].push_back(observation);
+            }
 
             // Update marker position
             auto& marker = marker_positions[marker_id];
@@ -423,17 +878,29 @@ int main(int argc, char **argv)
             } else {
                 // Weighted average based on confidence
                 float alpha = confidence / (marker.confidence + confidence);
-                marker.position = marker.position * (1 - alpha) + new_position * alpha;
-                marker.orientation = marker.orientation * (1 - alpha) + new_orientation * alpha;
+                marker.position = marker.position * (1-alpha) + new_position * alpha;
+                marker.orientation = marker.orientation * (1-alpha) + new_orientation * alpha;
                 marker.confidence = (marker.confidence + confidence) / 2;
             }
 
-            // Output current marker position (you can modify this based on your needs)
-            std::cout << "Marker " << marker_id << " Position (in camera frame):" 
-                      << " x: " << new_position.x
-                      << " y: " << new_position.y
-                      << " z: " << new_position.z 
-                      << " confidence: " << confidence << std::endl;
+            // Only print marker information during recording and when multiple markers are visible
+            double current_time = zed.getTimestamp(sl::TIME_REFERENCE::IMAGE).getMilliseconds();
+            if (!recording_sessions.empty() && 
+                recording_sessions.back().is_recording && 
+                ids.size() >= 2 && 
+                (current_time - last_print_time) > PRINT_INTERVAL_MS) {
+                
+                std::cout << "Detected " << ids.size() << " markers:" << std::endl;
+                for (size_t j = 0; j < ids.size(); j++) {
+                    auto& marker = marker_positions[ids[j]];
+                    std::cout << "Marker " << ids[j] << " Position: "
+                              << "x: " << marker.position.x
+                              << " y: " << marker.position.y
+                              << " z: " << marker.position.z 
+                              << " confidence: " << marker.confidence << std::endl;
+                }
+                last_print_time = current_time;
+            }
         }
 
         // Optional: Visualize markers
@@ -593,6 +1060,25 @@ int main(int argc, char **argv)
 
     if (key == 's' || key == 'S') {
         saveMarkerPositions("marker_positions.csv");
+    }
+
+    if (key == 'r' || key == 'R') {
+        if (recording_sessions.empty() || !recording_sessions.back().is_recording) {
+            startRecording();
+        } else {
+            stopRecording();
+        }
+    }
+
+    if (key == 'l' || key == 'L') {
+        saveAbsolutePositions("absolute_marker_positions.csv");
+    }
+
+    if (!recording_sessions.empty() && recording_sessions.back().is_recording) {
+        // Add a red circle indicator when recording
+        cv::circle(image_ocv_rgb, cv::Point(image_ocv_rgb.cols - 30, 30), 10, cv::Scalar(0, 0, 255), -1);
+        cv::putText(image_ocv_rgb, "REC", cv::Point(image_ocv_rgb.cols - 80, 35),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
     }
   }
   zed.close();
